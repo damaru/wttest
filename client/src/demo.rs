@@ -1,97 +1,72 @@
 use anyhow::Result;
-use bytes::Bytes;
-use quinn::Connection;
-use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
+use wtransport::Connection;
 
 /// Demonstrate bidirectional streaming
-pub async fn demo_bidirectional(connection: Arc<Connection>) -> Result<()> {
+pub async fn demo_bidirectional(connection: &Connection) -> Result<()> {
     info!("=== Bidirectional Stream Demo ===");
-    
-    let (mut send, mut recv) = connection.open_bi().await?;
-    
-    // Send a message
+
+    let (mut send, mut recv) = connection.open_bi().await?.await?;
+
     let message = "Hello from bidirectional stream!";
     send.write_all(message.as_bytes()).await?;
-    send.finish()?;
-    
+    send.finish().await?;
+
     info!("Sent: {}", message);
-    
-    // Read the response
-    let response = recv.read_to_end(1024).await?;
-    let response_str = String::from_utf8_lossy(&response);
-    info!("Received: {}", response_str);
-    
+
+    let response = read_stream_to_string(&mut recv).await?;
+    info!("Received: {}", response);
+
     Ok(())
 }
 
 /// Demonstrate unidirectional streaming
-pub async fn demo_unidirectional(connection: Arc<Connection>) -> Result<()> {
+pub async fn demo_unidirectional(connection: &Connection) -> Result<()> {
     info!("=== Unidirectional Stream Demo ===");
-    
-    // Send a log message
-    let mut send = connection.open_uni().await?;
-    let log_message = "log:This is a log message from the client";
-    send.write_all(log_message.as_bytes()).await?;
-    send.finish()?;
-    info!("Sent log message: {}", log_message);
-    
-    // Wait a bit
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    
-    // Send a command
-    let mut send = connection.open_uni().await?;
-    let command_message = "command:status";
-    send.write_all(command_message.as_bytes()).await?;
-    send.finish()?;
-    info!("Sent command: {}", command_message);
-    
+
+    let mut send = connection.open_uni().await?.await?;
+    let message = "log:This is a log message from the client";
+    send.write_all(message.as_bytes()).await?;
+    send.finish().await?;
+    info!("Sent unidirectional message: {}", message);
+
+    let mut response = connection.accept_uni().await?;
+    let response = read_stream_to_string(&mut response).await?;
+    info!("Received server unidirectional response: {}", response);
+
     Ok(())
 }
 
 /// Demonstrate datagram communication
-pub async fn demo_datagram(connection: Arc<Connection>) -> Result<()> {
+pub async fn demo_datagram(connection: &Connection) -> Result<()> {
     info!("=== Datagram Demo ===");
-    
-    // Send ping
-    let ping_data = Bytes::from("ping");
-    connection.send_datagram(ping_data.clone())?;
-    info!("Sent ping datagram");
-    
-    // Wait for response
-    tokio::time::timeout(Duration::from_secs(5), async {
-        if let Ok(response) = connection.read_datagram().await {
-            let response_str = String::from_utf8_lossy(&response);
-            info!("Received datagram response: {}", response_str);
-        }
-    }).await.ok();
-    
-    // Send time request
-    let time_data = Bytes::from("time");
-    connection.send_datagram(time_data.clone())?;
-    info!("Sent time request datagram");
-    
-    // Wait for response
-    tokio::time::timeout(Duration::from_secs(5), async {
-        if let Ok(response) = connection.read_datagram().await {
-            let response_str = String::from_utf8_lossy(&response);
-            info!("Received time response: {}", response_str);
-        }
-    }).await.ok();
-    
-    // Send echo message
-    let echo_data = Bytes::from("Hello, WebTransport!");
-    connection.send_datagram(echo_data.clone())?;
-    info!("Sent echo datagram: {}", String::from_utf8_lossy(&echo_data));
-    
-    // Wait for echo response
-    tokio::time::timeout(Duration::from_secs(5), async {
-        if let Ok(response) = connection.read_datagram().await {
-            let response_str = String::from_utf8_lossy(&response);
-            info!("Received echo response: {}", response_str);
-        }
-    }).await.ok();
-    
+
+    send_datagram_and_log_response(connection, "ping").await?;
+    send_datagram_and_log_response(connection, "Hello, WebTransport over HTTP/3!").await?;
+
     Ok(())
+}
+
+async fn send_datagram_and_log_response(connection: &Connection, message: &str) -> Result<()> {
+    connection.send_datagram(message.as_bytes())?;
+    info!("Sent datagram: {}", message);
+
+    let response =
+        tokio::time::timeout(Duration::from_secs(5), connection.receive_datagram()).await??;
+    let response = String::from_utf8_lossy(&response);
+    info!("Received datagram response: {}", response);
+
+    Ok(())
+}
+
+async fn read_stream_to_string(recv: &mut wtransport::stream::RecvStream) -> Result<String> {
+    let mut buffer = vec![0; 4096];
+    let mut data = Vec::new();
+
+    while let Some(bytes_read) = recv.read(&mut buffer).await? {
+        data.extend_from_slice(&buffer[..bytes_read]);
+    }
+
+    Ok(String::from_utf8_lossy(&data).to_string())
 }

@@ -36,21 +36,22 @@ http://127.0.0.1:8080
 
 Click **Connect**, then send a datagram or stream message. The default `ping` datagram should receive `pong`.
 
-### Run the Rust client:
+### Run the Rust HTTP/3 WebTransport client:
 ```bash
 cargo run -p client
 ```
 
-Note: the Rust client uses raw QUIC from the original demo and is not compatible with the browser WebTransport server.
+You can also point it at another endpoint:
+
+```bash
+cargo run -p client -- --url https://127.0.0.1:4433/ --demo datagram
+```
 
 ## Dependencies
 
 - `wtransport` - WebTransport over HTTP/3 implementation
 - `axum` - HTTP server for the browser test page
-- `quinn` - QUIC implementation used by the Rust client
 - `tokio` - Async runtime
-- `rustls` - TLS implementation
-- `rcgen` - Certificate generation
 - `anyhow` - Error handling
 - `tracing` - Logging
 

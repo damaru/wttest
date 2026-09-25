@@ -1,10 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
-use quinn::Endpoint;
-use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info};
+use wtransport::Endpoint;
 
 mod config;
 mod demo;
@@ -14,21 +12,17 @@ use demo::{demo_bidirectional, demo_datagram, demo_unidirectional};
 
 #[derive(Parser, Debug)]
 #[command(name = "webtransport-client")]
-#[command(about = "A WebTransport client implementation")]
+#[command(about = "A WebTransport-over-HTTP/3 client implementation")]
 struct Args {
-    /// Server address
-    #[arg(short, long, default_value = "127.0.0.1:4433")]
-    server: SocketAddr,
-
-    /// Server name for SNI
-    #[arg(short, long, default_value = "localhost")]
-    name: String,
+    /// WebTransport URL
+    #[arg(short, long, default_value = "https://127.0.0.1:4433/")]
+    url: String,
 
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
 
-    /// Skip certificate verification (for self-signed certs)
+    /// Skip certificate verification for self-signed development certificates
     #[arg(long, default_value = "true")]
     insecure: bool,
 
@@ -41,7 +35,6 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize tracing
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(if args.verbose {
             tracing::Level::DEBUG
@@ -51,52 +44,40 @@ async fn main() -> Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    info!("Connecting to WebTransport server at {}", args.server);
+    info!("Connecting to WebTransport server at {}", args.url);
 
-    // Configure client
-    let client_config = configure_client(args.insecure)?;
-    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
-    endpoint.set_default_client_config(client_config);
-
-    // Connect to server
-    let connection = endpoint
-        .connect(args.server, &args.name)?
-        .await?;
+    let client_config = configure_client(args.insecure);
+    let endpoint = Endpoint::client(client_config)?;
+    let connection = endpoint.connect(&args.url).await?;
 
     info!("Connected to server");
 
-    let connection = Arc::new(connection);
-
-    // Run demos based on the specified mode
     match args.demo.as_str() {
         "bidirectional" | "bidi" => {
-            demo_bidirectional(connection.clone()).await?;
+            demo_bidirectional(&connection).await?;
         }
         "unidirectional" | "uni" => {
-            demo_unidirectional(connection.clone()).await?;
+            demo_unidirectional(&connection).await?;
         }
         "datagram" | "dgram" => {
-            demo_datagram(connection.clone()).await?;
+            demo_datagram(&connection).await?;
         }
         "all" => {
             info!("Running all demos...");
-            
-            // Run bidirectional demo
-            if let Err(err) = demo_bidirectional(connection.clone()).await {
+
+            if let Err(err) = demo_bidirectional(&connection).await {
                 error!("Bidirectional demo failed: {}", err);
             }
-            
+
             tokio::time::sleep(Duration::from_millis(100)).await;
-            
-            // Run unidirectional demo
-            if let Err(err) = demo_unidirectional(connection.clone()).await {
+
+            if let Err(err) = demo_unidirectional(&connection).await {
                 error!("Unidirectional demo failed: {}", err);
             }
-            
+
             tokio::time::sleep(Duration::from_millis(100)).await;
-            
-            // Run datagram demo
-            if let Err(err) = demo_datagram(connection.clone()).await {
+
+            if let Err(err) = demo_datagram(&connection).await {
                 error!("Datagram demo failed: {}", err);
             }
         }
@@ -107,13 +88,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Keep connection alive for a bit
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // Close connection gracefully
     connection.close(0u32.into(), b"demo completed");
-    
-    // Wait for connection to close
     connection.closed().await;
     info!("Connection closed");
 
