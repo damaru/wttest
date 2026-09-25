@@ -1,24 +1,29 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use axum::http::header::CONTENT_TYPE;
+use axum::response::Html;
+use axum::routing::get;
+use axum::Router;
 use clap::Parser;
-use quinn::{Endpoint, ServerConfig};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpListener;
 use tracing::{error, info};
-
-mod cert;
-mod handlers;
-
-use cert::generate_self_signed_cert;
-use handlers::{handle_bidirectional_stream, handle_datagram, handle_unidirectional_stream};
+use tracing_subscriber::filter::LevelFilter;
+use wtransport::endpoint::IncomingSession;
+use wtransport::tls::{Sha256Digest, Sha256DigestFmt};
+use wtransport::{Endpoint, Identity, ServerConfig};
 
 #[derive(Parser, Debug)]
 #[command(name = "webtransport-server")]
-#[command(about = "A WebTransport server implementation")]
+#[command(about = "Browser-testable WebTransport-over-HTTP/3 server")]
 struct Args {
-    /// Listen address
+    /// WebTransport listen address
     #[arg(short, long, default_value = "127.0.0.1:4433")]
     listen: SocketAddr,
+
+    /// HTTP address for the browser test page
+    #[arg(long, default_value = "127.0.0.1:8080")]
+    http: SocketAddr,
 
     /// Enable verbose logging
     #[arg(short, long)]
@@ -28,136 +33,201 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    init_logging(args.verbose);
 
-    // Install default crypto provider
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let identity = Identity::self_signed(["localhost", "127.0.0.1", "::1"])?;
+    let cert_digest = identity.certificate_chain().as_slice()[0].hash();
 
-    // Initialize tracing
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(if args.verbose {
-            tracing::Level::DEBUG
-        } else {
-            tracing::Level::INFO
-        })
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+    let webtransport = WebTransportServer::new(args.listen, identity)?;
+    let http = HttpServer::new(args.http, cert_digest, webtransport.local_addr()).await?;
 
-    info!("Starting WebTransport server on {}", args.listen);
+    info!("Open http://{} in Chrome or Edge", http.local_addr());
+    info!(
+        "WebTransport endpoint: https://{}",
+        webtransport.local_addr()
+    );
 
-    // Generate self-signed certificate
-    let (cert, key) = generate_self_signed_cert()?;
-    let cert_chain = vec![cert];
-    let key_der = PrivateKeyDer::try_from(key)?;
-
-    // Configure server
-    let server_config = configure_server(cert_chain, key_der)?;
-    let endpoint = Endpoint::server(server_config, args.listen)?;
-
-    info!("Server listening on {}", args.listen);
-    info!("Use the following certificate fingerprint to connect:");
-    // In a real implementation, you'd print the actual fingerprint
-
-    // Accept connections
-    while let Some(conn) = endpoint.accept().await {
-        let conn_future = conn;
-        tokio::spawn(async move {
-            match conn_future.await {
-                Ok(connection) => handle_connection(connection).await,
-                Err(err) => error!("Connection failed: {}", err),
-            }
-        });
+    tokio::select! {
+        result = webtransport.serve() => {
+            error!("WebTransport server stopped: {:?}", result);
+        }
+        result = http.serve() => {
+            error!("HTTP test page stopped: {:?}", result);
+        }
     }
 
     Ok(())
 }
 
-fn configure_server(
-    cert_chain: Vec<CertificateDer<'static>>,
-    key_der: PrivateKeyDer<'static>,
-) -> Result<ServerConfig> {
-    let server_config = ServerConfig::with_single_cert(cert_chain, key_der)?;
-    
-    Ok(server_config)
+struct WebTransportServer {
+    endpoint: Endpoint<wtransport::endpoint::endpoint_side::Server>,
 }
 
-async fn handle_connection(connection: quinn::Connection) {
+impl WebTransportServer {
+    fn new(listen: SocketAddr, identity: Identity) -> Result<Self> {
+        let config = ServerConfig::builder()
+            .with_bind_address(listen)
+            .with_identity(identity)
+            .keep_alive_interval(Some(Duration::from_secs(3)))
+            .build();
+
+        let endpoint = Endpoint::server(config)?;
+        Ok(Self { endpoint })
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        self.endpoint
+            .local_addr()
+            .expect("endpoint has local address")
+    }
+
+    async fn serve(self) -> Result<()> {
+        info!("WebTransport server listening on {}", self.local_addr());
+
+        for id in 0.. {
+            let incoming_session = self.endpoint.accept().await;
+            tokio::spawn(async move {
+                if let Err(err) = handle_session(incoming_session).await {
+                    error!(connection_id = id, "session failed: {err:?}");
+                }
+            });
+        }
+
+        Ok(())
+    }
+}
+
+async fn handle_session(incoming_session: IncomingSession) -> Result<()> {
+    let session_request = incoming_session.await?;
     info!(
-        "New connection from {}",
-        connection.remote_address()
+        "New session request: authority='{}' path='{}'",
+        session_request.authority(),
+        session_request.path()
     );
 
-    // Handle the connection
-    let connection = Arc::new(connection);
-    
-    // Clone connection for different handlers
-    let conn_bidi = connection.clone();
-    let conn_uni = connection.clone();
-    let conn_dgram = connection.clone();
+    let connection = session_request.accept().await?;
+    info!("Session accepted");
 
-    // Handle bidirectional streams
-    let bidi_task = tokio::spawn(async move {
-        loop {
-            match conn_bidi.accept_bi().await {
-                Ok((send, recv)) => {
-                    tokio::spawn(handle_bidirectional_stream(send, recv));
-                }
-                Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
-                    info!("Connection closed by application");
-                    break;
-                }
-                Err(err) => {
-                    error!("Failed to accept bidirectional stream: {}", err);
-                    break;
-                }
+    let mut buffer = vec![0; 64 * 1024].into_boxed_slice();
+
+    loop {
+        tokio::select! {
+            stream = connection.accept_bi() => {
+                let mut stream = stream?;
+                let Some(bytes_read) = stream.1.read(&mut buffer).await? else {
+                    continue;
+                };
+                let message = String::from_utf8_lossy(&buffer[..bytes_read]);
+                info!("Received bidirectional stream: {message}");
+                let response = format!("Echo: {message}");
+                stream.0.write_all(response.as_bytes()).await?;
+                stream.0.finish().await?;
             }
-        }
-    });
+            stream = connection.accept_uni() => {
+                let mut stream = stream?;
+                let Some(bytes_read) = stream.read(&mut buffer).await? else {
+                    continue;
+                };
+                let message = String::from_utf8_lossy(&buffer[..bytes_read]);
+                info!("Received unidirectional stream: {message}");
 
-    // Handle unidirectional streams
-    let uni_task = tokio::spawn(async move {
-        loop {
-            match conn_uni.accept_uni().await {
-                Ok(recv) => {
-                    tokio::spawn(handle_unidirectional_stream(recv));
-                }
-                Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
-                    info!("Connection closed by application");
-                    break;
-                }
-                Err(err) => {
-                    error!("Failed to accept unidirectional stream: {}", err);
-                    break;
-                }
+                let response = format!("Server received uni stream: {message}");
+                let mut response_stream = connection.open_uni().await?.await?;
+                response_stream.write_all(response.as_bytes()).await?;
+                response_stream.finish().await?;
             }
-        }
-    });
+            datagram = connection.receive_datagram() => {
+                let datagram = datagram?;
+                let message = String::from_utf8_lossy(&datagram);
+                info!("Received datagram: {message}");
 
-    // Handle datagrams
-    let dgram_task = tokio::spawn(async move {
-        loop {
-            match conn_dgram.read_datagram().await {
-                Ok(data) => {
-                    tokio::spawn(handle_datagram(conn_dgram.clone(), data));
-                }
-                Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
-                    info!("Connection closed by application");
-                    break;
-                }
-                Err(err) => {
-                    error!("Failed to read datagram: {}", err);
-                    break;
-                }
+                let response = if message.trim() == "ping" {
+                    "pong".to_string()
+                } else {
+                    format!("Echo: {message}")
+                };
+                connection.send_datagram(response.as_bytes())?;
             }
-        }
-    });
-
-    // Wait for connection to close
-    tokio::select! {
-        _ = bidi_task => {},
-        _ = uni_task => {},
-        _ = dgram_task => {},
-        _ = connection.closed() => {
-            info!("Connection closed");
         }
     }
+}
+
+struct HttpServer {
+    local_addr: SocketAddr,
+    router: Router,
+}
+
+impl HttpServer {
+    async fn new(
+        listen: SocketAddr,
+        cert_digest: Sha256Digest,
+        webtransport_addr: SocketAddr,
+    ) -> Result<Self> {
+        let digest = cert_digest.fmt(Sha256DigestFmt::BytesArray);
+        let wt_url = format!("https://localhost:{}/", webtransport_addr.port());
+
+        let index_html = include_str!("static/index.html").replace("${WEBTRANSPORT_URL}", &wt_url);
+        let client_js = include_str!("static/client.js")
+            .replace("${CERT_DIGEST}", &digest)
+            .replace("${WEBTRANSPORT_URL}", &wt_url);
+        let style_css = include_str!("static/style.css").to_string();
+
+        let router = Router::new()
+            .route(
+                "/",
+                get({
+                    let index_html = index_html.clone();
+                    move || async move { Html(index_html) }
+                }),
+            )
+            .route(
+                "/client.js",
+                get({
+                    let client_js = client_js.clone();
+                    move || async move { ([(CONTENT_TYPE, "application/javascript")], client_js) }
+                }),
+            )
+            .route(
+                "/style.css",
+                get({
+                    let style_css = style_css.clone();
+                    move || async move { ([(CONTENT_TYPE, "text/css")], style_css) }
+                }),
+            );
+
+        Ok(Self {
+            local_addr: listen,
+            router,
+        })
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    async fn serve(self) -> Result<()> {
+        let listener = TcpListener::bind(self.local_addr)
+            .await
+            .with_context(|| format!("failed to bind HTTP listener on {}", self.local_addr))?;
+        let local_addr = listener.local_addr()?;
+        info!("HTTP test page listening on http://{local_addr}");
+        axum::serve(listener, self.router)
+            .await
+            .context("HTTP server error")?;
+        Ok(())
+    }
+}
+
+fn init_logging(verbose: bool) {
+    let default_level = if verbose {
+        LevelFilter::DEBUG
+    } else {
+        LevelFilter::INFO
+    };
+
+    tracing_subscriber::fmt()
+        .with_target(true)
+        .with_level(true)
+        .with_max_level(default_level)
+        .init();
 }

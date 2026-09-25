@@ -23,19 +23,31 @@ cargo build
 
 ## Running
 
-### Start the server:
+### Start the browser-testable server:
 ```bash
 cargo run -p server
 ```
 
-### Run the client:
+Then open this page in Chrome or Edge:
+
+```text
+http://127.0.0.1:8080
+```
+
+Click **Connect**, then send a datagram or stream message. The default `ping` datagram should receive `pong`.
+
+### Run the Rust client:
 ```bash
 cargo run -p client
 ```
 
+Note: the Rust client uses raw QUIC from the original demo and is not compatible with the browser WebTransport server.
+
 ## Dependencies
 
-- `quinn` - QUIC implementation
+- `wtransport` - WebTransport over HTTP/3 implementation
+- `axum` - HTTP server for the browser test page
+- `quinn` - QUIC implementation used by the Rust client
 - `tokio` - Async runtime
 - `rustls` - TLS implementation
 - `rcgen` - Certificate generation

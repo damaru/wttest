@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WebTransport browser test</title>
+  <link rel="stylesheet" href="/style.css">
+  <script defer src="/client.js"></script>
+</head>
+<body>
+  <main>
+    <h1>WebTransport browser test</h1>
+
+    <section>
+      <h2>Connection</h2>
+      <label for="url">Endpoint</label>
+      <input id="url" type="text" value="${WEBTRANSPORT_URL}">
+      <button id="connect">Connect</button>
+      <p class="hint">Use Chrome or Edge. The server injects the temporary certificate hash into client.js.</p>
+    </section>
+
+    <section>
+      <h2>Send message</h2>
+      <textarea id="message">ping</textarea>
+      <fieldset>
+        <legend>Transport type</legend>
+        <label><input type="radio" name="send-type" value="datagram" checked> Datagram</label>
+        <label><input type="radio" name="send-type" value="bidi"> Bidirectional stream</label>
+        <label><input type="radio" name="send-type" value="uni"> Unidirectional stream</label>
+      </fieldset>
+      <button id="send" disabled>Send</button>
+    </section>
+
+    <section>
+      <h2>Event log</h2>
+      <ol id="log"></ol>
+    </section>
+  </main>
+</body>
+</html>
