@@ -1,0 +1,16 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+quinn = { workspace = true }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
